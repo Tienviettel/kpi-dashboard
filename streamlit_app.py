@@ -19,6 +19,7 @@ def calc_eps_cssr(d):
         ) * 100
     except:
         return 0
+
 def calc_eps_cdr(d):
     try:
         if d.get("LTE Call Attempt", 0) == 0:
@@ -26,6 +27,7 @@ def calc_eps_cdr(d):
         return d.get("LTE Call Drop", 0) / d.get("LTE Call Attempt", 1) * 100
     except:
         return 0
+
 def calc_tu_prb_dl(d):
     try:
         if d.get("LTE DL Physical Resource Block_Available", 0) == 0:
@@ -421,12 +423,10 @@ kpi_formulas = {
 
 # --- Mapping KPI đến các cột raw cần tính ---
 kpi_columns = {
-    "ePS-CSSR": [
-        "LTE RRC Setup Success", "LTE RRC Setup Attempt",
-        "LTE S1 Signaling Setup Success", "LTE S1 Signaling Setup Attempt",
-        "LTE E-RAB Initial Setup Success", "LTE E-RAB Additional Setup Success",
-        "LTE E-RAB Initial Setup Attempt", "LTE E-RAB Additional Setup Attempt"
-    ],
+    "ePS-CSSR": ["LTE RRC Setup Success", "LTE RRC Setup Attempt",
+                  "LTE S1 Signaling Setup Success", "LTE S1 Signaling Setup Attempt",
+                  "LTE E-RAB Initial Setup Success", "LTE E-RAB Additional Setup Success",
+                  "LTE E-RAB Initial Setup Attempt", "LTE E-RAB Additional Setup Attempt"],
     "ePS CDR": ["LTE Call Drop", "LTE Call Attempt"],
     "TU PRB DL": ["LTE DL Physical Resource Block_Used", "LTE DL Physical Resource Block_Available"],
     "TU PRB UL": ["LTE UL Physical Resource Block_Used", "LTE UL Physical Resource Block_Available"],
@@ -474,13 +474,43 @@ kpi_columns = {
 }
 
 # --- Hàm load và clean dữ liệu ---
+# --- Mapping cho TDD/FDD rename ---
+replace_dict_tdd = {
+    "PRB Number Used on Downlink Channel": "LTE DL Physical Resource Block_Used",
+    "PRB Number Available on Downlink Channel": "LTE DL Physical Resource Block_Available",
+    "PRB Number Used on Uplink Channel": "LTE UL Physical Resource Block_Used",
+    "PRB Number Available on Uplink Channel": "LTE UL Physical Resource Block_Available",
+    "LTE Upload User Throughput_denumerator": "LTE Upload User Throughput_denumerato",
+    "UL padding denumerator": "UL padding denominator"
+}
+
+def process_excel_file(file_buffer, is_tdd=False):
+    # Load Excel into DataFrame
+    xl = pd.ExcelFile(file_buffer, engine='openpyxl')
+    sheets = [s for s in xl.sheet_names if s.strip().lower() != "kpi(counter)"]
+    if not sheets:
+        return pd.DataFrame()
+    df_main = xl.parse(sheets[0])
+    # Clean column names
+    df_main.columns = [col if not isinstance(col, str) else col.replace("_FDD", "").replace("_TDD", "").strip()
+                       for col in df_main.columns]
+    if is_tdd:
+        df_main.rename(columns=replace_dict_tdd, inplace=True)
+    return df_main
+
 @st.cache_data
 def load_data(files):
     dfs = []
     for f in files:
-        df = pd.read_excel(f, engine='openpyxl')
-        df['Begin Time'] = pd.to_datetime(df.get('Begin Time', pd.NaT), errors='coerce')
-        df['Day'] = df['Begin Time'].dt.strftime('%d/%m/%Y')
+        # Determine TDD by filename
+        is_tdd = 'TDD' in getattr(f, 'name', '').upper()
+        # Use buffer or path
+        df = process_excel_file(f, is_tdd=is_tdd)
+        # Parse and clean
+        if 'Begin Time' in df.columns:
+            df['Begin Time'] = pd.to_datetime(df['Begin Time'], errors='coerce')
+            df['Day'] = df['Begin Time'].dt.strftime('%d/%m/%Y')
+        # Clean numeric columns
         for col in df.columns:
             if df[col].dtype == object:
                 df[col] = (df[col].astype(str)
@@ -488,32 +518,33 @@ def load_data(files):
                            .replace(['', 'nan', 'None'], '0'))
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         dfs.append(df)
+    # Concatenate all
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 # --- Giao diện Streamlit ---
-st.set_page_config(page_title="KPI Evaluation", layout="wide")
+st.set_page_config(page_title="KPI Evaluation Dashboard", layout="wide")
 st.title("KPI Evaluation Dashboard")
 
-with st.sidebar:
-    st.header("Upload Files")
-    perf_files = st.file_uploader("Upload Performance Excel (.xlsx)", type="xlsx", accept_multiple_files=True)
-
-    st.header("Select Dates & KPI")
-    selected_before = st.multiselect("Before Dates", [])  # sẽ cập nhật sau khi load data
-    selected_after  = st.multiselect("After Dates", [])
-    selected_kpi    = st.selectbox("Select KPI for Chart", list(kpi_formulas.keys()))
-    run = st.button("Run Analysis")
+# Sidebar: upload và chọn
+st.sidebar.header("1. Upload Performance Data")
+perf_files = st.sidebar.file_uploader(
+    "Excel files (.xlsx)", type="xlsx", accept_multiple_files=True
+)
 
 if perf_files:
+    # Load data
     df_raw = load_data(perf_files)
     days = sorted(df_raw['Day'].unique(), key=lambda d: datetime.strptime(d, '%d/%m/%Y'))
-    st.sidebar.multiselect("Before Dates", days, key="before", default=days[:1])
-    st.sidebar.multiselect("After Dates", days, key="after", default=days[-1:])
+
+    st.sidebar.header("2. Select Dates & KPI")
+    before = st.sidebar.multiselect("Before Dates", days, default=days[:1])
+    after  = st.sidebar.multiselect("After Dates", days, default=days[-1:])
+    selected_kpi = st.sidebar.selectbox(
+        "Select KPI for Chart", options=list(kpi_formulas.keys())
+    )
+    run = st.sidebar.button("Run Analysis")
 
     if run:
-        before = st.session_state.before
-        after  = st.session_state.after
-
         # --- Tính bảng so sánh ---
         rows = []
         for kpi, func in kpi_formulas.items():
@@ -522,34 +553,50 @@ if perf_files:
             sum_a = df_raw[df_raw['Day'].isin(after)][cols].sum()
             val_b = func(sum_b)
             val_a = func(sum_a)
-            comp  = (val_a - val_b) / val_b * 100 if val_b else float('inf') if val_a else 0
-            rows.append({"KPI": kpi, "Before": round(val_b,2), "After": round(val_a,2), "Compare (%)": round(comp,2)})
+            comp = (val_a - val_b) / val_b * 100 if val_b else (float('inf') if val_a else 0)
+            rows.append({"KPI": kpi, "Before": round(val_b, 2), "After": round(val_a, 2), "Compare (%)": round(comp, 2)})
         df_table = pd.DataFrame(rows)
 
-        # --- Tính data cho chart ---
-        chart = []
-        for day, grp in df_raw.groupby('Day'):
+        # --- Tính dữ liệu chart ---
+        chart_func = kpi_formulas[selected_kpi]
+        chart_data = []
+        for day_val in days:
+            grp = df_raw[df_raw['Day'] == day_val]
             sums = grp[kpi_columns[selected_kpi]].sum()
-            chart.append({"Day": datetime.strptime(day, '%d/%m/%Y'), "Value": func(sums)})
-        df_chart = pd.DataFrame(chart).sort_values('Day')
+            val = chart_func(sums)
+            chart_data.append({"Day": datetime.strptime(day_val, '%d/%m/%Y'), "Value": val})
+        df_chart = pd.DataFrame(chart_data).sort_values('Day')
 
         # --- Hiển thị song song ---
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Comparison Table")
             st.dataframe(df_table, use_container_width=True)
-            buf = BytesIO(); df_table.to_excel(buf, index=False); buf.seek(0)
-            st.download_button("Download Table Excel", buf,
-                               f"KPI_Table_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            buf = BytesIO()
+            df_table.to_excel(buf, index=False)
+            buf.seek(0)
+            st.download_button(
+                label="Download Table as Excel",
+                data=buf,
+                file_name=f"KPI_Table_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
         with col2:
             st.subheader(f"{selected_kpi} Over Time")
-            fig, ax = plt.subplots(); ax.plot(df_chart['Day'], df_chart['Value'], marker='o')
-            ax.set_xlabel('Date'); ax.set_ylabel(selected_kpi); plt.xticks(rotation=45)
+            fig, ax = plt.subplots()
+            ax.plot(df_chart['Day'], df_chart['Value'], marker='o')
+            ax.set_xlabel('Date')
+            ax.set_ylabel(selected_kpi)
+            plt.xticks(rotation=45)
             st.pyplot(fig)
-            buf2 = BytesIO(); fig.savefig(buf2, format='png', bbox_inches='tight'); buf2.seek(0)
-            st.download_button("Download Chart PNG", buf2,
-                               f"{selected_kpi}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                               "image/png")
+            buf2 = BytesIO()
+            fig.savefig(buf2, format='png', bbox_inches='tight', dpi=300)
+            buf2.seek(0)
+            st.download_button(
+                label="Download Chart as PNG",
+                data=buf2,
+                file_name=f"{selected_kpi}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                mime="image/png"
+            )
 else:
-    st.info("Please upload Performance Excel files to begin.")
+    st.info("Please upload Performance Excel file(s) to begin.")
