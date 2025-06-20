@@ -530,8 +530,6 @@ with st.sidebar:
     st.header("Upload Files")
     perf_files   = st.file_uploader("Performance Excel (.xlsx)", type="xlsx", accept_multiple_files=True)
     formula_file = st.file_uploader("KPI formulas (.xlsx, sheet 'KPI')", type="xlsx")
-perf_files = st.sidebar.file_uploader(
-    "Excel files (.xlsx)", type="xlsx", accept_multiple_files=True
 )
 
 if perf_files and formula_file:
