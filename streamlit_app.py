@@ -522,81 +522,88 @@ def load_data(files):
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 # --- Giao diện Streamlit ---
-st.set_page_config(page_title="KPI Evaluation Dashboard", layout="wide")
+st.set_page_config(page_title="KPI Dashboard", layout="wide")
 st.title("KPI Evaluation Dashboard")
 
-# Sidebar: upload và chọn
-st.sidebar.header("1. Upload Performance Data")
+# Sidebar upload
+with st.sidebar:
+    st.header("Upload Files")
+    perf_files   = st.file_uploader("Performance Excel (.xlsx)", type="xlsx", accept_multiple_files=True)
+    formula_file = st.file_uploader("KPI formulas (.xlsx, sheet 'KPI')", type="xlsx")
 perf_files = st.sidebar.file_uploader(
     "Excel files (.xlsx)", type="xlsx", accept_multiple_files=True
 )
 
-if perf_files:
-    # Load data
+if perf_files and formula_file:
+    # Load data và công thức
     df_raw = load_data(perf_files)
-    days = sorted(df_raw['Day'].unique(), key=lambda d: datetime.strptime(d, '%d/%m/%Y'))
+    formulas_df = pd.read_excel(formula_file, sheet_name='KPI', engine='openpyxl')
+    # Danh sách KPI từ sheet
+    kpi_list = [col for col in formulas_df.columns if col != formulas_df.columns[0]]
 
-    st.sidebar.header("2. Select Dates & KPI")
-    before = st.sidebar.multiselect("Before Dates", days, default=days[:1])
-    after  = st.sidebar.multiselect("After Dates", days, default=days[-1:])
-    selected_kpi = st.sidebar.selectbox(
-        "Select KPI for Chart", options=list(kpi_formulas.keys())
-    )
-    run = st.sidebar.button("Run Analysis")
+    # Chuẩn bị ngày
+    days = (pd.to_datetime(df_raw['Day'], format='%d/%m/%Y', errors='coerce')
+               .dropna().sort_values().dt.strftime('%d/%m/%Y').unique())
+
+    # Sidebar chọn ngày và KPI
+    with st.sidebar:
+        st.header("Select Dates & KPI")
+        before = st.multiselect("Before Dates", options=days)
+        after  = st.multiselect("After Dates", options=days)
+        selected_kpi = st.selectbox("Select KPI", options=kpi_list)
+        run = st.button("Run Analysis")
 
     if run:
-        # --- Tính bảng so sánh ---
-        rows = []
-        for kpi, func in kpi_formulas.items():
+        # Tính bảng so sánh
+        table_rows = []
+        for kpi in kpi_list:
+            func = kpi_formulas.get(kpi)
             cols = kpi_columns.get(kpi, [])
-            sum_b = df_raw[df_raw['Day'].isin(before)][cols].sum()
-            sum_a = df_raw[df_raw['Day'].isin(after)][cols].sum()
-            val_b = func(sum_b)
-            val_a = func(sum_a)
-            comp = (val_a - val_b) / val_b * 100 if val_b else (float('inf') if val_a else 0)
-            rows.append({"KPI": kpi, "Before": round(val_b, 2), "After": round(val_a, 2), "Compare (%)": round(comp, 2)})
-        df_table = pd.DataFrame(rows)
+            # Tổng raw
+            sum_b = df_raw[df_raw['Day'].isin(before)][cols].sum() if before else pd.Series(0)
+            sum_a = df_raw[df_raw['Day'].isin(after)][cols].sum()  if after  else pd.Series(0)
+            # Giá trị KPI
+            val_b = func(sum_b) if func else 0
+            val_a = func(sum_a) if func else 0
+            # Công thức so sánh từ sheet
+            formula_str = formulas_df[kpi].dropna().iloc[0]
+            try:
+                comp = eval(formula_str, {}, {'A': val_a, 'B': val_b})
+            except Exception:
+                comp = None
+            table_rows.append({'KPI': kpi, 'Before': round(val_b,2), 'After': round(val_a,2), 'Compare (%)': round(comp,2) if comp is not None else None})
+        df_table = pd.DataFrame(table_rows)
 
-        # --- Tính dữ liệu chart ---
-        chart_func = kpi_formulas[selected_kpi]
+        # Tính dữ liệu chart
         chart_data = []
-        for day_val in days:
-            grp = df_raw[df_raw['Day'] == day_val]
-            sums = grp[kpi_columns[selected_kpi]].sum()
-            val = chart_func(sums)
-            chart_data.append({"Day": datetime.strptime(day_val, '%d/%m/%Y'), "Value": val})
+        func = kpi_formulas.get(selected_kpi)
+        cols = kpi_columns.get(selected_kpi, [])
+        for day in days:
+            grp = df_raw[df_raw['Day'] == day]
+            sums = grp[cols].sum()
+            val  = func(sums) if func else 0
+            chart_data.append({'Day': datetime.strptime(day, '%d/%m/%Y'), 'Value': val})
         df_chart = pd.DataFrame(chart_data).sort_values('Day')
 
-        # --- Hiển thị song song ---
+        # Hiển thị song song
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Comparison Table")
             st.dataframe(df_table, use_container_width=True)
-            buf = BytesIO()
-            df_table.to_excel(buf, index=False)
-            buf.seek(0)
-            st.download_button(
-                label="Download Table as Excel",
-                data=buf,
-                file_name=f"KPI_Table_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+            buf = BytesIO(); df_table.to_excel(buf, index=False); buf.seek(0)
+            st.download_button("Download Table Excel", buf,
+                               file_name=f"KPI_Table_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         with col2:
             st.subheader(f"{selected_kpi} Over Time")
             fig, ax = plt.subplots()
             ax.plot(df_chart['Day'], df_chart['Value'], marker='o')
-            ax.set_xlabel('Date')
-            ax.set_ylabel(selected_kpi)
-            plt.xticks(rotation=45)
+            ax.set_xlabel('Date'); ax.set_ylabel(selected_kpi); plt.xticks(rotation=45)
             st.pyplot(fig)
-            buf2 = BytesIO()
-            fig.savefig(buf2, format='png', bbox_inches='tight', dpi=300)
-            buf2.seek(0)
-            st.download_button(
-                label="Download Chart as PNG",
-                data=buf2,
-                file_name=f"{selected_kpi}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                mime="image/png"
-            )
+            buf2 = BytesIO(); fig.savefig(buf2, format='png', bbox_inches='tight', dpi=300); buf2.seek(0)
+            st.download_button("Download Chart PNG", buf2,
+                               file_name=f"{selected_kpi}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                               mime="image/png")
 else:
-    st.info("Please upload Performance Excel file(s) to begin.")
+    st.info("Please upload Performance Excel(s) and KPI_formula.xlsx to begin.")
+
